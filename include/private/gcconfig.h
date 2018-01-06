@@ -2470,7 +2470,7 @@
 #   ifdef FREEBSD
 #       define OS_TYPE "FREEBSD"
 #       ifndef GC_FREEBSD_THREADS
-#           define MPROTECT_VDB
+#           define FBSD_MWW_VDB
 #       endif
 #       ifdef __GLIBC__
 #           define SIG_SUSPEND          (32+6)
@@ -2875,7 +2875,7 @@
 #endif
 
 #if !defined(PCR_VDB) && !defined(PROC_VDB) && !defined(MPROTECT_VDB) \
-    && !defined(GWW_VDB) && !defined(MANUAL_VDB) \
+    && !defined(GWW_VDB) && !defined(MANUAL_VDB) && !defined(FBSD_MWW_VDB) \
     && !defined(GC_DISABLE_INCREMENTAL)
 # define DEFAULT_VDB
 #endif

@@ -2759,10 +2759,12 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
  *              read dirty bits.  In case it is not available (because we
  *              are running on Windows 95, Windows 2000 or earlier),
  *              MPROTECT_VDB may be defined as a fallback strategy.
+ * FBSD_MWW_VDB:Use the experimental mwritewatch syscall in FreeBSD to read
+ *              dirty bits.
  */
 
 #if defined(GWW_VDB) || defined(MPROTECT_VDB) || defined(PROC_VDB) \
-    || defined(MANUAL_VDB)
+    || defined(FBSD_MWW_VDB) || defined(MANUAL_VDB)
   /* Is the HBLKSIZE sized page at h marked dirty in the local buffer?  */
   /* If the actual page size is different, this returns TRUE if any     */
   /* of the pages overlapping h are dirty.  This routine may err on the */
@@ -2778,7 +2780,8 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
   }
 #endif
 
-#if (defined(CHECKSUMS) && defined(GWW_VDB)) || defined(PROC_VDB)
+#if (defined(CHECKSUMS) && (defined(GWW_VDB) || defined(FBSD_MWW_VDB))) \
+    || defined(PROC_VDB)
     /* Add all pages in pht2 to pht1.   */
     STATIC void GC_or_pages(page_hash_table pht1, page_hash_table pht2)
     {
@@ -2802,7 +2805,7 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
 #endif /* CHECKSUMS && GWW_VDB || PROC_VDB */
 
 #if ((defined(GWW_VDB) || defined(PROC_VDB)) && !defined(MPROTECT_VDB)) \
-    || defined(MANUAL_VDB) || defined(DEFAULT_VDB)
+    || defined(FBSD_MWW_VDB) || defined(MANUAL_VDB) || defined(DEFAULT_VDB)
     /* Ignore write hints.  They don't help us here.    */
     GC_INNER void GC_remove_protection(struct hblk * h GC_ATTR_UNUSED,
                                        word nblocks GC_ATTR_UNUSED,
@@ -2947,6 +2950,103 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
 # endif /* CHECKSUMS */
 
 #endif /* DEFAULT_VDB */
+
+#ifdef FBSD_MWW_VDB
+
+/* TODO: These declarations should be in some header */
+#include <unistd.h>
+#define MWRITEWATCH_RESET   0x001
+
+int mwritewatch(void *addr0, size_t len, int flags, void *buf, size_t *naddr, size_t *granularity);
+
+STATIC int mwritewatch(void *addr0, size_t len, int flags, void *buf,
+                       size_t *naddr, size_t *granularity)
+{
+    return syscall(561, addr0, len, flags, buf, naddr, granularity);
+}
+
+# define GC_FBSD_MWW_BUF_LEN (MAXHINCR * HBLKSIZE / 4096 /* X86 page size */)
+  /* Still susceptible to overflow, if there are very large allocations, */
+  /* and everything is dirty.                                            */
+  static ptr_t fbsd_mww_buf[GC_FBSD_MWW_BUF_LEN];
+
+  /* Initialize virtual dirty bit implementation.       */
+  GC_INNER GC_bool GC_dirty_init(void)
+  {
+    GC_VERBOSE_LOG_PRINTF("Initializing FBSD_MWW_VDB...\n");
+    return TRUE;
+  }
+
+  /* Retrieve system dirty bits for heap to a local buffer.     */
+  /* Restore the systems notion of which pages are dirty.       */
+  GC_INNER void GC_read_dirty(GC_bool output_unneeded)
+  {
+    uint32_t i;
+
+    if (!output_unneeded)
+      BZERO(GC_grungy_pages, sizeof(GC_grungy_pages));
+
+    for (i = 0; i != GC_n_heap_sects; ++i) {
+      size_t count;
+      ptr_t addr0 = GC_heap_sects[i].hs_start;
+      size_t bytes = GC_heap_sects[i].hs_bytes;
+
+      do {
+        ptr_t* pages = fbsd_mww_buf;
+        size_t page_size;
+
+        count = GC_FBSD_MWW_BUF_LEN;
+
+        if (mwritewatch(addr0,
+                        bytes,
+                        MWRITEWATCH_RESET,
+                        pages,
+                        &count,
+                        &page_size) != 0) {
+          static int warn_count = 0;
+          struct hblk * start = (struct hblk *)GC_heap_sects[i].hs_start;
+          static struct hblk *last_warned = 0;
+          size_t nblocks = divHBLKSZ(GC_heap_sects[i].hs_bytes);
+
+          if (i != 0 && last_warned != start && warn_count++ < 5) {
+            last_warned = start;
+            WARN("mwritewatch unexpectedly failed at %p: "
+                 "Falling back to marking all pages dirty\n", start);
+          }
+          if (!output_unneeded) {
+            unsigned j;
+
+            for (j = 0; j < nblocks; ++j) {
+              word hash = PHT_HASH(start + j);
+              set_pht_entry_from_index(GC_grungy_pages, hash);
+            }
+          }
+          count = 1;  /* Done with this section. */
+        } else /* succeeded */ if (!output_unneeded) {
+          ptr_t* pages_end = pages + count;
+
+          /* Next iteration, if there will be one, should start from where    */
+          /* the previous call to mwritewatch left off.                       */
+          bytes -= pages[count - 1] - addr0;
+          addr0 = pages[count - 1];
+
+          while (pages != pages_end) {
+            struct hblk * h = (struct hblk *) *pages++;
+            struct hblk * h_end = (struct hblk *) ((char *) h + page_size);
+            do {
+              set_pht_entry_from_index(GC_grungy_pages, PHT_HASH(h));
+            } while ((word)(++h) < (word)h_end);
+          }
+        }
+      } while (count == GC_FBSD_MWW_BUF_LEN);
+    }
+
+#   ifdef CHECKSUMS
+      GC_ASSERT(!output_unneeded);
+      GC_or_pages(GC_written_pages, GC_grungy_pages);
+#   endif
+  }
+#endif /* FBSD_MWW_VDB */
 
 #ifdef MANUAL_VDB
   /* Initialize virtual dirty bit implementation.       */

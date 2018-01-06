@@ -1352,7 +1352,8 @@ struct _GC_arrays {
         /* GC_read_changed.                                             */
 # endif
 # if defined(PROC_VDB) || defined(MPROTECT_VDB) \
-     || defined(GWW_VDB) || defined(MANUAL_VDB)
+     || defined(GWW_VDB) || defined(MANUAL_VDB) \
+     || defined(FBSD_MWW_VDB)
 #   define GC_grungy_pages GC_arrays._grungy_pages
     page_hash_table _grungy_pages; /* Pages that were dirty at last     */
                                    /* GC_read_dirty.                    */
@@ -1362,7 +1363,8 @@ struct _GC_arrays {
     volatile page_hash_table _dirty_pages;
                         /* Pages dirtied since last GC_read_dirty. */
 # endif
-# if (defined(CHECKSUMS) && defined(GWW_VDB)) || defined(PROC_VDB)
+# if (defined(CHECKSUMS) && (defined(GWW_VDB) || defined(FBSD_MWW_VDB))) \
+     || defined(PROC_VDB)
 #   define GC_written_pages GC_arrays._written_pages
     page_hash_table _written_pages;     /* Pages ever dirtied   */
 # endif
