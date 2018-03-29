@@ -2956,6 +2956,7 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
 /* TODO: These declarations should be in some header */
 #include <unistd.h>
 #define MWRITEWATCH_RESET   0x001
+#define MWRITEWATCH_NOT_SHARED   0x002
 
 int mwritewatch(void *addr0, size_t len, int flags, void *buf, size_t *naddr, size_t *granularity);
 
@@ -2999,7 +3000,7 @@ STATIC int mwritewatch(void *addr0, size_t len, int flags, void *buf,
 
         if (mwritewatch(addr0,
                         bytes,
-                        MWRITEWATCH_RESET,
+                        MWRITEWATCH_RESET | MWRITEWATCH_NOT_SHARED,
                         pages,
                         &count,
                         &page_size) != 0) {
