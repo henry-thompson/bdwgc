@@ -2959,6 +2959,7 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
 #define MWRITEWATCH_NOT_SHARED   0x002
 
 int mwritewatch(void *addr0, size_t len, int flags, void *buf, size_t *naddr, size_t *granularity);
+int mwritereset(void *addr0, size_t len, int flags);
 
 STATIC int mwritewatch(void *addr0, size_t len, int flags, void *buf,
                        size_t *naddr, size_t *granularity)
@@ -2966,7 +2967,12 @@ STATIC int mwritewatch(void *addr0, size_t len, int flags, void *buf,
     return syscall(561, addr0, len, flags, buf, naddr, granularity);
 }
 
-# define GC_FBSD_MWW_BUF_LEN (MAXHINCR * HBLKSIZE / 4096 /* X86 page size */)
+STATIC int mwritereset(void *addr0, size_t len, int flags)
+{
+    return syscall(562, addr0, len, flags);
+}
+
+# define GC_FBSD_MWW_BUF_LEN 16
   /* Still susceptible to overflow, if there are very large allocations, */
   /* and everything is dirty.                                            */
   static ptr_t fbsd_mww_buf[GC_FBSD_MWW_BUF_LEN];
@@ -2992,6 +2998,11 @@ STATIC int mwritewatch(void *addr0, size_t len, int flags, void *buf,
       ptr_t addr0 = GC_heap_sects[i].hs_start;
       size_t bytes = GC_heap_sects[i].hs_bytes;
 
+      if (output_unneeded) {
+        mwritereset(addr0, bytes, MWRITEWATCH_NOT_SHARED);
+        continue;
+      }
+
       do {
         ptr_t* pages = fbsd_mww_buf;
         size_t page_size;
@@ -3014,16 +3025,14 @@ STATIC int mwritewatch(void *addr0, size_t len, int flags, void *buf,
             WARN("mwritewatch unexpectedly failed at %p: "
                  "Falling back to marking all pages dirty\n", start);
           }
-          if (!output_unneeded) {
-            unsigned j;
+          unsigned j;
 
-            for (j = 0; j < nblocks; ++j) {
-              word hash = PHT_HASH(start + j);
-              set_pht_entry_from_index(GC_grungy_pages, hash);
-            }
+          for (j = 0; j < nblocks; ++j) {
+            word hash = PHT_HASH(start + j);
+            set_pht_entry_from_index(GC_grungy_pages, hash);
           }
           count = 1;  /* Done with this section. */
-        } else /* succeeded */ if (!output_unneeded) {
+        } else {
           ptr_t* pages_end = pages + count;
 
           /* Next iteration, if there will be one, should start from where    */
