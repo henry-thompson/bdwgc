@@ -2972,7 +2972,7 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
     return syscall(562, addr0, len, flags);
 }
 
-# define GC_FBSD_MWW_BUF_LEN 16
+# define GC_FBSD_MWW_BUF_LEN (MAXHINCR * HBLKSIZE / 4096 /* X86 page size */) 
   /* Still susceptible to overflow, if there are very large allocations, */
   /* and everything is dirty.                                            */
   static ptr_t fbsd_mww_buf[GC_FBSD_MWW_BUF_LEN];
@@ -2998,6 +2998,13 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
       ptr_t addr0 = GC_heap_sects[i].hs_start;
       size_t bytes = GC_heap_sects[i].hs_bytes;
 
+      // System calls are expensive. Combine adjacent sects to reduce
+      // the number of them.
+      while (i + 1 < GC_n_heap_sects && GC_heap_sects[i + 1].hs_start == addr0 + bytes) {
+	 i++;
+         bytes += GC_heap_sects[i].hs_bytes;
+      }
+
       if (output_unneeded) {
         mwritereset(addr0, bytes, MWRITEWATCH_NOT_SHARED);
         continue;
@@ -3007,7 +3014,7 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
         ptr_t* pages = fbsd_mww_buf;
         size_t page_size;
 
-        count = GC_FBSD_MWW_BUF_LEN;
+        count = bytes < GC_FBSD_MWW_BUF_LEN ? bytes : GC_FBSD_MWW_BUF_LEN;
 
         if (mwritewatch(addr0,
                         bytes,
