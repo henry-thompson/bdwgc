@@ -3014,8 +3014,8 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
         ptr_t* pages = fbsd_mww_buf;
         size_t page_size;
 
-        count = bytes < GC_FBSD_MWW_BUF_LEN ? bytes : GC_FBSD_MWW_BUF_LEN;
 
+        count = (bytes / 4096) < GC_FBSD_MWW_BUF_LEN ? (bytes / 4096) : GC_FBSD_MWW_BUF_LEN;
         if (mwritewatch(addr0,
                         bytes,
                         MWRITEWATCH_RESET | MWRITEWATCH_NOT_SHARED,
