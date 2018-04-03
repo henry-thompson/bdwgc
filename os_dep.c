@@ -2805,7 +2805,7 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
 #endif /* CHECKSUMS && GWW_VDB || PROC_VDB */
 
 #if ((defined(GWW_VDB) || defined(PROC_VDB)) && !defined(MPROTECT_VDB)) \
-    || defined(FBSD_MWW_VDB) || defined(MANUAL_VDB) || defined(DEFAULT_VDB)
+    || defined(MANUAL_VDB) || defined(DEFAULT_VDB)
     /* Ignore write hints.  They don't help us here.    */
     GC_INNER void GC_remove_protection(struct hblk * h GC_ATTR_UNUSED,
                                        word nblocks GC_ATTR_UNUSED,
@@ -2977,36 +2977,463 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
   /* and everything is dirty.                                            */
   static ptr_t fbsd_mww_buf[GC_FBSD_MWW_BUF_LEN];
 
-  /* Initialize virtual dirty bit implementation.       */
+#include <sys/mman.h>
+#include <signal.h>
+#include <sys/syscall.h>
+
+#define PROTECT(addr, len) \
+        if (mprotect((caddr_t)(addr), (size_t)(len), \
+                     PROT_READ \
+                     | (GC_pages_executable ? PROT_EXEC : 0)) >= 0) { \
+        } else ABORT("mprotect failed")
+#define UNPROTECT(addr, len) \
+        if (mprotect((caddr_t)(addr), (size_t)(len), \
+                     (PROT_READ | PROT_WRITE) \
+                     | (GC_pages_executable ? PROT_EXEC : 0)) >= 0) { \
+        } else ABORT(GC_pages_executable ? \
+                                "un-mprotect executable page failed" \
+                                    " (probably disabled by OS)" : \
+                                "un-mprotect failed")
+#undef IGNORE_PAGES_EXECUTABLE
+
+typedef void (* SIG_HNDLR_PTR)(int, siginfo_t *, void *);
+typedef void (* PLAIN_HNDLR_PTR)(int);
+
+# if defined(__GLIBC__)
+#   if __GLIBC__ < 2 || __GLIBC__ == 2 && __GLIBC_MINOR__ < 2
+#       error glibc too old?
+#   endif
+# endif
+
+STATIC SIG_HNDLR_PTR GC_old_segv_handler = 0;
+STATIC SIG_HNDLR_PTR GC_old_bus_handler = 0;
+STATIC GC_bool GC_old_bus_handler_used_si = FALSE;
+STATIC GC_bool GC_old_segv_handler_used_si = FALSE;
+
+#if defined(THREADS)
+  /* This function is used only by the fault handler.  Potential data   */
+  /* race between this function and GC_install_header, GC_remove_header */
+  /* should not be harmful because the added or removed header should   */
+  /* be already unprotected.                                            */
+  GC_ATTR_NO_SANITIZE_THREAD
+  static GC_bool is_header_found_async(void *addr)
+  {
+#   ifdef HASH_TL
+      hdr *result;
+      GET_HDR((ptr_t)addr, result);
+      return result != NULL;
+#   else
+      return HDR_INNER(addr) != NULL;
+#   endif
+  }
+
+#else /* !THREADS */
+# define is_header_found_async(addr) (HDR(addr) != NULL)
+#endif /* !THREADS */
+
+# ifdef CHECKSUMS
+    void GC_record_fault(struct hblk * h); /* from checksums.c */
+# endif
+
+word lookup_sect(ptr_t);
+word lookup_sect(ptr_t addr)
+{
+    word first = 0;
+    word last = GC_n_heap_sects - 1;
+    word i = (first + last) / 2;
+
+    while (first <= last) {
+        ptr_t start = GC_heap_sects[i].hs_start;
+        size_t len = GC_heap_sects[i].hs_bytes;
+
+       if (start <= addr && start + len >= start) {
+           return i;
+       } else if (start <= addr) {
+          first = i + 1;
+       } else {
+          last = i - 1;
+       }
+
+       i = (first + last) / 2;
+    }
+
+    return GC_n_heap_sects;
+}
+
+#   include <errno.h>
+#   define SIG_OK (sig == SIGBUS || sig == SIGSEGV)
+#     ifndef SEGV_ACCERR
+#       define SEGV_ACCERR 2
+#     endif
+#     if defined(AARCH64) || defined(ARM32) || defined(MIPS)
+#       define CODE_OK (si -> si_code == SEGV_ACCERR)
+#     elif defined(POWERPC)
+#       define AIM  /* Pretend that we're AIM. */
+#       include <machine/trap.h>
+#       define CODE_OK (si -> si_code == EXC_DSI \
+                        || si -> si_code == SEGV_ACCERR)
+#     else
+#       define CODE_OK (si -> si_code == BUS_PAGE_FAULT \
+                        || si -> si_code == SEGV_ACCERR)
+#     endif
+#   ifndef NO_GETCONTEXT
+#     include <ucontext.h>
+#   endif
+
+STATIC void GC_write_fault_handler(int sig, siginfo_t *si, void *raw_sc)
+{
+    char *addr = si -> si_addr;
+
+    if (!SIG_OK || !CODE_OK) {
+      ABORT_ARG1("Unexpected bus error or segmentation fault",
+                 " at %p", (void *)addr);
+      return;
+    }
+
+    register struct hblk * h = (struct hblk *)((word)addr & ~(GC_page_size-1));
+    GC_bool in_allocd_block;
+
+# ifdef CHECKSUMS
+        GC_record_fault(h);
+# endif
+
+    in_allocd_block = is_header_found_async(addr);
+
+    if (!in_allocd_block) {
+        /* FIXME - We should make sure that we invoke the   */
+        /* old handler with the appropriate calling         */
+        /* sequence, which often depends on SA_SIGINFO.     */
+
+        /* Heap blocks now begin and end on page boundaries */
+        SIG_HNDLR_PTR old_handler;
+
+        GC_bool used_si;
+
+        if (sig == SIGBUS) {
+            old_handler = GC_old_bus_handler;
+            used_si = GC_old_bus_handler_used_si;
+        } else {
+            old_handler = GC_old_segv_handler;
+            used_si = GC_old_segv_handler_used_si;
+        }
+
+        if (old_handler == (SIG_HNDLR_PTR)SIG_DFL) {
+            ABORT_ARG1("Unexpected bus error or segmentation fault",
+                        " at %p", (void *)addr);
+        } else {
+            /*
+             * FIXME: This code should probably check if the
+             * old signal handler used the traditional style and
+             * if so call it using that style.
+             */
+            if (used_si)
+                ((SIG_HNDLR_PTR)old_handler) (sig, si, raw_sc);
+            else
+                /* FIXME: should pass nonstandard args as well. */
+                ((PLAIN_HNDLR_PTR)old_handler) (sig);
+            return;
+        }
+    }
+
+    /* We have caught a fault in the heap! This means the program   */
+    /* is trying to write here. We assume that this part of the     */
+    /* program is therefore in the working set, and mark the        */
+    /* corresponding sect so. Later, we use mwritewatch in that     */
+    /* region, as its faster for small regions of memory than       */
+    /* catching SIGSEGVs.                                           */
+
+    /* Mark this sect as being part of the working set.             */
+    word sindex = lookup_sect(addr);
+
+    if (sindex == GC_n_heap_sects) {
+        ABORT("Page fault in a region without a heap sector!");
+    }
+
+    ptr_t start = GC_heap_sects[sindex].hs_start;
+    word bytes = 0;
+
+    do {
+      GC_heap_sects[sindex].in_working_set = TRUE;
+      bytes += GC_heap_sects[sindex++].hs_bytes;
+    } while (sindex < GC_n_heap_sects &&
+            GC_heap_sects[sindex].hs_start == (ptr_t)(start + bytes) &&
+            GC_heap_sects[sindex].hs_start <= (ptr_t)(h + HBLKSIZE));
+
+    UNPROTECT(start, start + bytes);
+
+    /* No need to record that this page was written to - we will scan  */
+    /* the region with mwritewatch later anyway.                       */
+  }
+
+/* We hold the allocation lock.  We expect block h to be written        */
+/* shortly.  Ensure that all pages containing any part of the n hblks   */
+/* starting at h are no longer protected.  If is_ptrfree is FALSE, also */
+/* ensure that they will subsequently appear to be dirty.  Not allowed  */
+/* to call GC_printf (and the friends) here, see Win32 GC_stop_world()  */
+/* for the information.                                                 */
+GC_INNER void GC_remove_protection(struct hblk *h, word nblocks,
+                                   GC_bool is_ptrfree)
+{
+    struct hblk * h_trunc;  /* Truncated to page boundary */
+    struct hblk * h_end;    /* Page boundary following block end */
+
+    if (!GC_incremental) return;
+
+    h_trunc = (struct hblk *)((word)h & ~(GC_page_size-1));
+    h_end = (struct hblk *)(((word)(h + nblocks) + GC_page_size - 1) & ~(GC_page_size - 1));
+
+    word sindex = lookup_sect((ptr_t)h);
+
+    if (sindex == GC_n_heap_sects) {
+        ABORT("Attempting to remove protection on page without a sect!");
+    }
+
+    ptr_t start = GC_heap_sects[sindex].hs_start;
+    word bytes = 0;
+
+    GC_bool all_in_working_set_already = TRUE;
+
+    do {
+        bytes += GC_heap_sects[sindex].hs_bytes;
+        all_in_working_set_already &= GC_heap_sects[sindex].in_working_set;
+        GC_heap_sects[sindex++].in_working_set = TRUE;
+    } while (sindex < GC_n_heap_sects &&
+             start + bytes == GC_heap_sects[sindex].hs_start &&
+             start + bytes <= (ptr_t) h_end);
+
+    if (all_in_working_set_already) {
+        /* In working set so unprotected already. */
+        return;
+    }
+
+    UNPROTECT(start, start + bytes);
+
+    /* We are going to rescan this page later to see if it was actually       */
+    /* written to, so ignore is_ptrfree                       .               */
+}
+
+#ifdef USE_MUNMAP
+  GC_INNER GC_bool GC_has_unmapped_memory(void); /* from allchblk.c */
+  GC_INNER GC_bool GC_mprotect_dirty_init(void);
+
+  /* MPROTECT_VDB cannot deal with address space holes (for now),   */
+  /* so if the collector is configured with both MPROTECT_VDB and   */
+  /* USE_MUNMAP then, as a work around, select only one of them     */
+  /* during GC_init or GC_enable_incremental.                       */
   GC_INNER GC_bool GC_dirty_init(void)
   {
-    GC_VERBOSE_LOG_PRINTF("Initializing FBSD_MWW_VDB...\n");
+    if (GC_unmap_threshold != 0) {
+      if (GETENV("GC_UNMAP_THRESHOLD") != NULL
+          || GETENV("GC_FORCE_UNMAP_ON_GCOLLECT") != NULL
+          || GC_has_unmapped_memory()) {
+        WARN("Can't maintain mprotect-based dirty bits"
+             " in case of unmapping\n", 0);
+        return FALSE;
+      }
+      GC_unmap_threshold = 0; /* in favor of incremental collection */
+      WARN("Memory unmapping is disabled as incompatible"
+           " with MPROTECT_VDB\n", 0);
+    }
+    return GC_mprotect_dirty_init();
+  }
+#else
+# define GC_mprotect_dirty_init GC_dirty_init
+#endif /* !USE_MUNMAP */
+
+  GC_INNER GC_bool GC_mprotect_dirty_init(void)
+  {
+
+      GC_VERBOSE_LOG_PRINTF("Initializing FBSD_MWW_VDB...\n");
+      struct sigaction act, oldact;
+      act.sa_flags = SA_RESTART | SA_SIGINFO;
+      act.sa_sigaction = GC_write_fault_handler;
+      (void)sigemptyset(&act.sa_mask);
+#     if defined(THREADS)
+        /* Arrange to postpone the signal while we are in a write fault */
+        /* handler.  This effectively makes the handler atomic w.r.t.   */
+        /* stopping the world for GC.                                   */
+        (void)sigaddset(&act.sa_mask, GC_get_suspend_signal());
+#     endif
+
+    GC_VERBOSE_LOG_PRINTF(
+                "Initializing mprotect virtual dirty bit implementation\n");
+    if (GC_page_size % HBLKSIZE != 0) {
+        ABORT("Page size not multiple of HBLKSIZE");
+    }
+
+      /* act.sa_restorer is deprecated and should not be initialized. */
+#     if defined(GC_IRIX_THREADS)
+        sigaction(SIGSEGV, 0, &oldact);
+        sigaction(SIGSEGV, &act, 0);
+#     else
+        {
+          int res = sigaction(SIGSEGV, &act, &oldact);
+          if (res != 0) ABORT("Sigaction failed");
+        }
+#     endif
+      if (oldact.sa_flags & SA_SIGINFO) {
+        GC_old_segv_handler = oldact.sa_sigaction;
+        GC_old_segv_handler_used_si = TRUE;
+      } else {
+        GC_old_segv_handler = (SIG_HNDLR_PTR)oldact.sa_handler;
+        GC_old_segv_handler_used_si = FALSE;
+      }
+      if (GC_old_segv_handler == (SIG_HNDLR_PTR)SIG_IGN) {
+        WARN("Previously ignored segmentation violation!?\n", 0);
+        GC_old_segv_handler = (SIG_HNDLR_PTR)SIG_DFL;
+      }
+      if (GC_old_segv_handler != (SIG_HNDLR_PTR)SIG_DFL) {
+        GC_VERBOSE_LOG_PRINTF("Replaced other SIGSEGV handler\n");
+      }
+#   if (defined(FREEBSD) && defined(SUNOS5SIGS))
+      sigaction(SIGBUS, &act, &oldact);
+      if ((oldact.sa_flags & SA_SIGINFO) != 0) {
+        GC_old_bus_handler = oldact.sa_sigaction;
+          GC_old_bus_handler_used_si = TRUE;
+      } else {
+        GC_old_bus_handler = (SIG_HNDLR_PTR)oldact.sa_handler;
+        GC_old_bus_handler_used_si = FALSE;
+      }
+      if (GC_old_bus_handler == (SIG_HNDLR_PTR)SIG_IGN) {
+        WARN("Previously ignored bus error!?\n", 0);
+        GC_old_bus_handler = (SIG_HNDLR_PTR)SIG_DFL;
+      } else if (GC_old_bus_handler != (SIG_HNDLR_PTR)SIG_DFL) {
+          GC_VERBOSE_LOG_PRINTF("Replaced other SIGBUS handler\n");
+      }
+#   endif /* FREEBSD && SUNOS5SIGS */
+
+#   if defined(CPPCHECK) && defined(ADDRESS_SANITIZER)
+      GC_noop1((word)&__asan_default_options);
+#   endif
     return TRUE;
   }
 
-  /* Retrieve system dirty bits for heap to a local buffer.     */
-  /* Restore the systems notion of which pages are dirty.       */
-  GC_INNER void GC_read_dirty(GC_bool output_unneeded)
-  {
-    uint32_t i;
+GC_API int GC_CALL GC_incremental_protection_needs(void)
+{
+    GC_ASSERT(GC_is_initialized);
+
+    if (GC_page_size == HBLKSIZE) {
+        return GC_PROTECTS_POINTER_HEAP;
+    } else {
+        return GC_PROTECTS_POINTER_HEAP | GC_PROTECTS_PTRFREE_HEAP;
+    }
+}
+#define HAVE_INCREMENTAL_PROTECTION_NEEDS
+
+#define IS_PTRFREE(hhdr) ((hhdr)->hb_descr == 0)
+#define PAGE_ALIGNED(x) !((word)(x) & (GC_page_size - 1))
+
+STATIC void GC_protect_heap(void)
+{
+    unsigned i = 0;
+    GC_bool protect_all =
+        (0 != (GC_incremental_protection_needs() & GC_PROTECTS_PTRFREE_HEAP));
+
+    while (i < GC_n_heap_sects) {
+        ptr_t start = GC_heap_sects[i].hs_start;
+
+        if (GC_heap_sects[i].in_working_set) {
+            /* Don't protect areas in use by the program.                */
+            i++;
+            continue;
+        }
+
+        /* Combine contiguous sects.                                     */
+        word len = 0;
+
+        do {
+            len += GC_heap_sects[i++].hs_bytes;
+        } while (i < GC_n_heap_sects &&
+               GC_heap_sects[i].hs_start == start + len &&
+               GC_heap_sects[i].in_working_set == FALSE);
+
+        if (protect_all) {
+          PROTECT(start, len);
+        } else {
+          struct hblk * current;
+          struct hblk * current_start; /* Start of block to be protected. */
+          struct hblk * limit;
+
+          GC_ASSERT(PAGE_ALIGNED(len));
+          GC_ASSERT(PAGE_ALIGNED(start));
+          current_start = current = (struct hblk *)start;
+          limit = (struct hblk *)(start + len);
+          while ((word)current < (word)limit) {
+            hdr * hhdr;
+            word nhblks;
+            GC_bool is_ptrfree;
+
+            GC_ASSERT(PAGE_ALIGNED(current));
+            GET_HDR(current, hhdr);
+            if (IS_FORWARDING_ADDR_OR_NIL(hhdr)) {
+              /* This can happen only if we're at the beginning of a    */
+              /* heap segment, and a block spans heap segments.         */
+              /* We will handle that block as part of the preceding     */
+              /* segment.                                               */
+              GC_ASSERT(current_start == current);
+              current_start = ++current;
+              continue;
+            }
+            if (HBLK_IS_FREE(hhdr)) {
+              GC_ASSERT(PAGE_ALIGNED(hhdr -> hb_sz));
+              nhblks = divHBLKSZ(hhdr -> hb_sz);
+              is_ptrfree = TRUE;        /* dirty on alloc */
+            } else {
+              nhblks = OBJ_SZ_TO_BLOCKS(hhdr -> hb_sz);
+              is_ptrfree = IS_PTRFREE(hhdr);
+            }
+            if (is_ptrfree) {
+              if ((word)current_start < (word)current) {
+                PROTECT(current_start, (ptr_t)current - (ptr_t)current_start);
+              }
+              current_start = (current += nhblks);
+            } else {
+              current += nhblks;
+            }
+          }
+          if ((word)current_start < (word)current) {
+            PROTECT(current_start, (ptr_t)current - (ptr_t)current_start);
+          }
+        }
+    }
+}
+
+GC_INNER void GC_read_dirty(GC_bool output_unneeded)
+{
+    uint32_t i = 0;
 
     if (!output_unneeded)
       BZERO(GC_grungy_pages, sizeof(GC_grungy_pages));
 
-    for (i = 0; i != GC_n_heap_sects; ++i) {
-      size_t count;
-      ptr_t addr0 = GC_heap_sects[i].hs_start;
-      size_t bytes = GC_heap_sects[i].hs_bytes;
-
-      // System calls are expensive. Combine adjacent sects to reduce
-      // the number of them.
-      while (i + 1 < GC_n_heap_sects && GC_heap_sects[i + 1].hs_start == addr0 + bytes) {
-	 i++;
-         bytes += GC_heap_sects[i].hs_bytes;
+    while (i != GC_n_heap_sects) {
+      /* Only sects "in_working_set" require scanning.                        */
+      if (!GC_heap_sects[i].in_working_set) {
+          i++;
+          continue;
       }
 
+      size_t dirty_count;
+      uint32_t i1 = i;
+
+      /* System calls are expensive. Combine adjacent sects to reduce         */
+      /* the number of them.                                                  */
+      size_t bytes = 0;
+      ptr_t start = GC_heap_sects[i].hs_start;
+
+      do {
+        if (!output_unneeded) {
+            GC_heap_sects[i].in_working_set = FALSE;
+        }
+
+        bytes += GC_heap_sects[i++].hs_bytes;
+      } while (i < GC_n_heap_sects &&
+               start + bytes == GC_heap_sects[i].hs_start &&
+               GC_heap_sects[i].in_working_set);
+
+      /* If we are just resetting and no output is needed, call the reset API */
+      /* instead and move on.                                                 */
       if (output_unneeded) {
-        mwritereset(addr0, bytes, MWRITEWATCH_NOT_SHARED);
+        mwritereset(start, bytes, MWRITEWATCH_NOT_SHARED);
         continue;
       }
 
@@ -3014,14 +3441,10 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
         ptr_t* pages = fbsd_mww_buf;
         size_t page_size;
 
+        dirty_count = (bytes / 4096) < GC_FBSD_MWW_BUF_LEN ? (bytes / 4096) : GC_FBSD_MWW_BUF_LEN;
 
-        count = (bytes / 4096) < GC_FBSD_MWW_BUF_LEN ? (bytes / 4096) : GC_FBSD_MWW_BUF_LEN;
-        if (mwritewatch(addr0,
-                        bytes,
-                        MWRITEWATCH_RESET | MWRITEWATCH_NOT_SHARED,
-                        pages,
-                        &count,
-                        &page_size) != 0) {
+        if (mwritewatch(start, bytes, MWRITEWATCH_RESET | MWRITEWATCH_NOT_SHARED,
+                        pages, &dirty_count, &page_size) != 0) {
           static int warn_count = 0;
           struct hblk * start = (struct hblk *)GC_heap_sects[i].hs_start;
           static struct hblk *last_warned = 0;
@@ -3038,31 +3461,78 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
             word hash = PHT_HASH(start + j);
             set_pht_entry_from_index(GC_grungy_pages, hash);
           }
-          count = 1;  /* Done with this section. */
-        } else {
-          ptr_t* pages_end = pages + count;
 
-          /* Next iteration, if there will be one, should start from where    */
+          dirty_count = 1;  /* Done with this section. */
+
+        } else {
+          ptr_t* pages_end = pages + dirty_count;
+
+          /* Next iteration, if there is one, should start from where         */
           /* the previous call to mwritewatch left off.                       */
-          bytes -= pages[count - 1] - addr0;
-          addr0 = pages[count - 1];
+          bytes -= pages[dirty_count - 1] - start;
+          start = pages[dirty_count - 1];
+
+          /* Heap sects which had writes to them are considered to be in the  */
+          /* working set.                                                     */
+          ptr_t sect_start = GC_heap_sects[i1].hs_start;
+          ptr_t sect_end   = sect_start + GC_heap_sects[i1].hs_bytes;
 
           while (pages != pages_end) {
             struct hblk * h = (struct hblk *) *pages++;
             struct hblk * h_end = (struct hblk *) ((char *) h + page_size);
+
+            /* Figure out which heap sect this address came from.             */
+            while (sect_end < (ptr_t)h) {
+                i1++;
+                sect_start = GC_heap_sects[i1].hs_start;
+                sect_end   = sect_start + GC_heap_sects[i1].hs_bytes;
+            }
+
+            /* Mark the sects this block came from has in the working set.    */
+            while (sect_start <= (ptr_t)h_end) {
+                GC_heap_sects[i1].in_working_set = TRUE;
+                i1++;
+                sect_start = GC_heap_sects[i1].hs_start;
+                sect_end   = sect_start + GC_heap_sects[i1].hs_bytes;
+            }
+
             do {
               set_pht_entry_from_index(GC_grungy_pages, PHT_HASH(h));
             } while ((word)(++h) < (word)h_end);
           }
         }
-      } while (count == GC_FBSD_MWW_BUF_LEN);
+      } while (dirty_count == GC_FBSD_MWW_BUF_LEN);
     }
+
+    GC_protect_heap();
 
 #   ifdef CHECKSUMS
       GC_ASSERT(!output_unneeded);
       GC_or_pages(GC_written_pages, GC_grungy_pages);
 #   endif
-  }
+}
+
+/*
+ * Acquiring the allocation lock here is dangerous, since this
+ * can be called from within GC_call_with_alloc_lock, and the cord
+ * package does so.  On systems that allow nested lock acquisition, this
+ * happens to work.
+ */
+
+/* We no longer wrap read by default, since that was causing too many   */
+/* problems.  It is preferred that the client instead avoids writing    */
+/* to the write-protected heap with a system call.                      */
+
+# ifdef CHECKSUMS
+    GC_INNER GC_bool GC_page_was_ever_dirty(struct hblk * h GC_ATTR_UNUSED)
+    {
+      return(TRUE);
+    }
+# endif /* CHECKSUMS */
+
+
+/******************************************************************************/
+
 #endif /* FBSD_MWW_VDB */
 
 #ifdef MANUAL_VDB
