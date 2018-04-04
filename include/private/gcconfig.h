@@ -2469,9 +2469,7 @@
 #   endif
 #   ifdef FREEBSD
 #       define OS_TYPE "FREEBSD"
-#       ifndef GC_FREEBSD_THREADS
-#           define FBSD_MWW_VDB
-#       endif
+#       define FBSD_MWW_VDB
 #       ifdef __GLIBC__
 #           define SIG_SUSPEND          (32+6)
 #           define SIG_THR_RESTART      (32+5)
