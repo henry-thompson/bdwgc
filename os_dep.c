@@ -2972,7 +2972,7 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
     return syscall(562, addr0, len, flags);
 }
 
-# define GC_FBSD_MWW_BUF_LEN (MAXHINCR * HBLKSIZE / 4096 /* X86 page size */) 
+# define GC_FBSD_MWW_BUF_LEN 16 
   /* Still susceptible to overflow, if there are very large allocations, */
   /* and everything is dirty.                                            */
   static ptr_t fbsd_mww_buf[GC_FBSD_MWW_BUF_LEN];
@@ -3015,7 +3015,6 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
         size_t page_size;
 
 
-        count = (bytes / 4096) < GC_FBSD_MWW_BUF_LEN ? (bytes / 4096) : GC_FBSD_MWW_BUF_LEN;
         if (mwritewatch(addr0,
                         bytes,
                         MWRITEWATCH_RESET | MWRITEWATCH_NOT_SHARED,
