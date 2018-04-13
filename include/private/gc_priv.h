@@ -1372,9 +1372,6 @@ struct _GC_arrays {
   struct HeapSect {
     ptr_t hs_start;
     size_t hs_bytes;
-#  ifdef FBSD_MWW_VDB
-    GC_bool in_working_set;
-#   endif
   } _heap_sects[MAX_HEAP_SECTS];        /* Heap segments potentially    */
                                         /* client objects.              */
 # if defined(USE_PROC_FOR_LIBRARIES)
