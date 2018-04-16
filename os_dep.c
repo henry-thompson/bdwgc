@@ -2994,7 +2994,7 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
       BZERO(GC_grungy_pages, sizeof(GC_grungy_pages));
 
     for (i = 0; i != GC_n_heap_sects; ++i) {
-      size_t count;
+      size_t count = GC_FBSD_MWW_BUF_LEN;
       ptr_t addr0 = GC_heap_sects[i].hs_start;
       size_t bytes = GC_heap_sects[i].hs_bytes;
 
