@@ -2972,10 +2972,9 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
     return syscall(562, addr0, len, flags);
 }
 
-# define GC_FBSD_MWW_BUF_LEN 16 
+# define GC_FBSD_MWW_BUF_LEN (MAXHINCR * HBLKSIZE / 4096 /* X86 page size */)
   /* Still susceptible to overflow, if there are very large allocations, */
   /* and everything is dirty.                                            */
-  static ptr_t fbsd_mww_buf[GC_FBSD_MWW_BUF_LEN];
 
   /* Initialize virtual dirty bit implementation.       */
   GC_INNER GC_bool GC_dirty_init(void)
@@ -2988,6 +2987,7 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
   /* Restore the systems notion of which pages are dirty.       */
   GC_INNER void GC_read_dirty(GC_bool output_unneeded)
   {
+    ptr_t fbsd_mww_buf[GC_FBSD_MWW_BUF_LEN];
     uint32_t i;
 
     if (!output_unneeded)
