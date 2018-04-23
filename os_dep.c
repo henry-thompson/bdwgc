@@ -2959,17 +2959,11 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
 #define MWRITEWATCH_NOT_SHARED   0x002
 
 int mwritewatch(void *addr0, size_t len, int flags, void *buf, size_t *naddr, size_t *granularity);
-int mwritereset(void *addr0, size_t len, int flags);
 
-STATIC int mwritewatch(void *addr0, size_t len, int flags, void *buf,
-                       size_t *naddr, size_t *granularity)
+STATIC int mwritten(void *addr0, size_t len, int flags, void *buf,
+                       size_t *naddr, size_t *gran)
 {
-    return syscall(561, addr0, len, flags, buf, naddr, granularity);
-}
-
-STATIC int mwritereset(void *addr0, size_t len, int flags)
-{
-    return syscall(562, addr0, len, flags);
+    return syscall(561, addr0, len, flags, buf, naddr, gran);
 }
 
 # define GC_FBSD_MWW_BUF_LEN (MAXHINCR * HBLKSIZE / 4096 /* X86 page size */)
@@ -3001,26 +2995,20 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
       // System calls are expensive. Combine adjacent sects to reduce
       // the number of them.
       while (i + 1 < GC_n_heap_sects && GC_heap_sects[i + 1].hs_start == addr0 + bytes) {
-	 i++;
-         bytes += GC_heap_sects[i].hs_bytes;
-      }
-
-      if (output_unneeded) {
-        mwritereset(addr0, bytes, MWRITEWATCH_NOT_SHARED);
-        continue;
+        i++;
+        bytes += GC_heap_sects[i].hs_bytes;
       }
 
       do {
         ptr_t* pages = fbsd_mww_buf;
         size_t page_size;
 
-
-        if (mwritewatch(addr0,
-                        bytes,
-                        MWRITEWATCH_RESET | MWRITEWATCH_NOT_SHARED,
-                        pages,
-                        &count,
-                        &page_size) != 0) {
+        if (mwritten(addr0,
+                bytes,
+                MWRITEWATCH_RESET | MWRITEWATCH_NOT_SHARED,
+                !output_unneeded ? pages : NULL,
+                !output_unneeded ? &count : NULL,
+                &page_size) != 0) {
           static int warn_count = 0;
           struct hblk * start = (struct hblk *)GC_heap_sects[i].hs_start;
           static struct hblk *last_warned = 0;
@@ -3031,14 +3019,17 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
             WARN("mwritewatch unexpectedly failed at %p: "
                  "Falling back to marking all pages dirty\n", start);
           }
-          unsigned j;
 
-          for (j = 0; j < nblocks; ++j) {
-            word hash = PHT_HASH(start + j);
-            set_pht_entry_from_index(GC_grungy_pages, hash);
+          if (!output_unneeded) {
+            unsigned j;
+
+            for (j = 0; j < nblocks; ++j) {
+              word hash = PHT_HASH(start + j);
+              set_pht_entry_from_index(GC_grungy_pages, hash);
+            }
           }
           count = 1;  /* Done with this section. */
-        } else {
+        } else if (!output_unneeded) {
           ptr_t* pages_end = pages + count;
 
           /* Next iteration, if there will be one, should start from where    */
@@ -3054,6 +3045,11 @@ STATIC int mwritereset(void *addr0, size_t len, int flags)
             } while ((word)(++h) < (word)h_end);
           }
         }
+
+        if (output_unneeded) {
+          break;
+        }
+
       } while (count == GC_FBSD_MWW_BUF_LEN);
     }
 
