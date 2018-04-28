@@ -2759,7 +2759,7 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
  *              read dirty bits.  In case it is not available (because we
  *              are running on Windows 95, Windows 2000 or earlier),
  *              MPROTECT_VDB may be defined as a fallback strategy.
- * FBSD_MWW_VDB:Use the experimental mwritewatch syscall in FreeBSD to read
+ * FBSD_MWW_VDB:Use the experimental mwritten syscall in FreeBSD to read
  *              dirty bits.
  */
 
@@ -2953,19 +2953,6 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
 
 #ifdef FBSD_MWW_VDB
 
-/* TODO: These declarations should be in some header */
-#include <unistd.h>
-#define MWRITEWATCH_RESET   0x001
-#define MWRITEWATCH_NOT_SHARED   0x002
-
-int mwritewatch(void *addr0, size_t len, int flags, void *buf, size_t *naddr, size_t *granularity);
-
-STATIC int mwritten(void *addr0, size_t len, int flags, void *buf,
-                       size_t *naddr, size_t *gran)
-{
-    return syscall(561, addr0, len, flags, buf, naddr, gran);
-}
-
 # define GC_FBSD_MWW_BUF_LEN (MAXHINCR * HBLKSIZE / 4096 /* X86 page size */)
   /* Still susceptible to overflow, if there are very large allocations, */
   /* and everything is dirty.                                            */
@@ -3005,7 +2992,7 @@ STATIC int mwritten(void *addr0, size_t len, int flags, void *buf,
 
         if (mwritten(addr0,
                 bytes,
-                MWRITEWATCH_RESET | MWRITEWATCH_NOT_SHARED,
+                MWRITTEN_CLEAR | MWRITTEN_NOT_SHARED,
                 !output_unneeded ? pages : NULL,
                 !output_unneeded ? &count : NULL,
                 &page_size) != 0) {
@@ -3016,7 +3003,7 @@ STATIC int mwritten(void *addr0, size_t len, int flags, void *buf,
 
           if (i != 0 && last_warned != start && warn_count++ < 5) {
             last_warned = start;
-            WARN("mwritewatch unexpectedly failed at %p: "
+            WARN("mwritten unexpectedly failed at %p: "
                  "Falling back to marking all pages dirty\n", start);
           }
 
@@ -3033,7 +3020,7 @@ STATIC int mwritten(void *addr0, size_t len, int flags, void *buf,
           ptr_t* pages_end = pages + count;
 
           /* Next iteration, if there will be one, should start from where    */
-          /* the previous call to mwritewatch left off.                       */
+          /* the previous call to mwritten left off.                       */
           bytes -= pages[count - 1] - addr0;
           addr0 = pages[count - 1];
 
