@@ -2759,12 +2759,12 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
  *              read dirty bits.  In case it is not available (because we
  *              are running on Windows 95, Windows 2000 or earlier),
  *              MPROTECT_VDB may be defined as a fallback strategy.
- * FBSD_MWW_VDB:Use the experimental mwritten syscall in FreeBSD to read
+ * FBSD_MW_VDB:Use the experimental mwritten syscall in FreeBSD to read
  *              dirty bits.
  */
 
 #if defined(GWW_VDB) || defined(MPROTECT_VDB) || defined(PROC_VDB) \
-    || defined(FBSD_MWW_VDB) || defined(MANUAL_VDB)
+    || defined(FBSD_MW_VDB) || defined(MANUAL_VDB)
   /* Is the HBLKSIZE sized page at h marked dirty in the local buffer?  */
   /* If the actual page size is different, this returns TRUE if any     */
   /* of the pages overlapping h are dirty.  This routine may err on the */
@@ -2780,7 +2780,7 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
   }
 #endif
 
-#if (defined(CHECKSUMS) && (defined(GWW_VDB) || defined(FBSD_MWW_VDB))) \
+#if (defined(CHECKSUMS) && (defined(GWW_VDB) || defined(FBSD_MW_VDB))) \
     || defined(PROC_VDB)
     /* Add all pages in pht2 to pht1.   */
     STATIC void GC_or_pages(page_hash_table pht1, page_hash_table pht2)
@@ -2805,7 +2805,7 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
 #endif /* CHECKSUMS && GWW_VDB || PROC_VDB */
 
 #if ((defined(GWW_VDB) || defined(PROC_VDB)) && !defined(MPROTECT_VDB)) \
-    || defined(FBSD_MWW_VDB) || defined(MANUAL_VDB) || defined(DEFAULT_VDB)
+    || defined(FBSD_MW_VDB) || defined(MANUAL_VDB) || defined(DEFAULT_VDB)
     /* Ignore write hints.  They don't help us here.    */
     GC_INNER void GC_remove_protection(struct hblk * h GC_ATTR_UNUSED,
                                        word nblocks GC_ATTR_UNUSED,
@@ -2951,16 +2951,16 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
 
 #endif /* DEFAULT_VDB */
 
-#ifdef FBSD_MWW_VDB
+#ifdef FBSD_MW_VDB
 
-# define GC_FBSD_MWW_BUF_LEN (MAXHINCR * HBLKSIZE / 4096 /* X86 page size */)
+# define GC_FBSD_MW_BUF_LEN (MAXHINCR * HBLKSIZE / 4096 /* X86 page size */)
   /* Still susceptible to overflow, if there are very large allocations, */
   /* and everything is dirty.                                            */
 
   /* Initialize virtual dirty bit implementation.       */
   GC_INNER GC_bool GC_dirty_init(void)
   {
-    GC_VERBOSE_LOG_PRINTF("Initializing FBSD_MWW_VDB...\n");
+    GC_VERBOSE_LOG_PRINTF("Initializing FBSD_MW_VDB...\n");
     return TRUE;
   }
 
@@ -2968,14 +2968,14 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
   /* Restore the systems notion of which pages are dirty.       */
   GC_INNER void GC_read_dirty(GC_bool output_unneeded)
   {
-    ptr_t fbsd_mww_buf[GC_FBSD_MWW_BUF_LEN];
+    ptr_t fbsd_mw_buf[GC_FBSD_MW_BUF_LEN];
     uint32_t i;
 
     if (!output_unneeded)
       BZERO(GC_grungy_pages, sizeof(GC_grungy_pages));
 
     for (i = 0; i != GC_n_heap_sects; ++i) {
-      size_t count = GC_FBSD_MWW_BUF_LEN;
+      size_t count = GC_FBSD_MW_BUF_LEN;
       ptr_t addr0 = GC_heap_sects[i].hs_start;
       size_t bytes = GC_heap_sects[i].hs_bytes;
 
@@ -2987,7 +2987,7 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
       }
 
       do {
-        ptr_t* pages = fbsd_mww_buf;
+        ptr_t* pages = fbsd_mw_buf;
         size_t page_size;
 
         if (mwritten(addr0,
@@ -3037,7 +3037,7 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
           break;
         }
 
-      } while (count == GC_FBSD_MWW_BUF_LEN);
+      } while (count == GC_FBSD_MW_BUF_LEN);
     }
 
 #   ifdef CHECKSUMS
@@ -3045,7 +3045,7 @@ GC_API GC_push_other_roots_proc GC_CALL GC_get_push_other_roots(void)
       GC_or_pages(GC_written_pages, GC_grungy_pages);
 #   endif
   }
-#endif /* FBSD_MWW_VDB */
+#endif /* FBSD_MW_VDB */
 
 #ifdef MANUAL_VDB
   /* Initialize virtual dirty bit implementation.       */
